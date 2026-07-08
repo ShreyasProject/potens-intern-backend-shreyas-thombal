@@ -4,7 +4,7 @@
 
 **A production-ready, append-only audit log API with cryptographic SHA-256 hash chaining.**
 
-Every log entry is cryptographically linked to the one before it.  
+Every log entry is cryptographically linked to the one before it.
 Tamper with any record and the entire chain breaks — instantly detectable.
 
 [![Node.js](https://img.shields.io/badge/Node.js-18%2B-339933?logo=nodedotjs&logoColor=white)](https://nodejs.org/)
@@ -613,5 +613,3 @@ npm run test:coverage
 Built with Node.js · Express · PostgreSQL · Prisma · Docker
 
 </div>
-#   p o t e n s - i n t e r n - b a c k e n d - s h r e y a s - t h o m b a l  
- 
