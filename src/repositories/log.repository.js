@@ -3,19 +3,31 @@
 /**
  * @file src/repositories/log.repository.js
  *
- * Data-access layer for LogEntry records.
+ * Data-access layer for LogEntry and ChainHead records.
  *
  * Responsibilities:
  *   - All Prisma queries live here and NOWHERE else.
- *   - No business logic, no hash computation, no error throwing.
- *   - Transactions are handled here when atomicity is required.
+ *   - No business logic, no Redis, no BullMQ.
+ *   - Transaction boundaries (including the row-level lock) are owned here.
+ *   - Hash computation happens inside the transaction after the lock is acquired.
+ *
+ * Exported API:
+ *   findById(id)
+ *   findLatest()
+ *   findAll(page, pageSize)
+ *   findAllOrdered()
+ *   findFiltered(filters)
+ *   count()
+ *   createWithTransaction(dto) — lock → read hash → compute → insert → update
  *
  * @module repositories/log
  */
 
 const { prisma } = require('../config/database');
+const hashService = require('../services/hash.service');
+const { logger } = require('../lib/logger');
 
-// ─── Single-record reads ──────────────────────────────────────────────────────
+// ── Single-record reads ───────────────────────────────────────────────────────
 
 /**
  * Find a single LogEntry by UUID.
@@ -29,7 +41,6 @@ async function findById(id) {
 
 /**
  * Return the most recently inserted LogEntry (createdAt DESC).
- * Returns null when the table is empty — caller handles genesis case.
  *
  * @returns {Promise<object|null>}
  */
@@ -39,7 +50,6 @@ async function findLatest() {
 
 /**
  * Return the entry immediately before the given createdAt timestamp.
- * Useful when you need the predecessor by time rather than ID.
  *
  * @param {Date} createdAt
  * @returns {Promise<object|null>}
@@ -51,13 +61,13 @@ async function findPrevious(createdAt) {
   });
 }
 
-// ─── List reads ───────────────────────────────────────────────────────────────
+// ── List reads ────────────────────────────────────────────────────────────────
 
 /**
  * Return a paginated list of LogEntry records ordered by createdAt ASC.
  *
- * @param {number} page     - 1-based page index.
- * @param {number} pageSize - Records per page.
+ * @param {number} page
+ * @param {number} pageSize
  * @returns {Promise<object[]>}
  */
 async function findAll(page, pageSize) {
@@ -70,7 +80,6 @@ async function findAll(page, pageSize) {
 
 /**
  * Return ALL records ordered by createdAt ASC (no pagination).
- * Used for full-chain verification and export.
  *
  * @returns {Promise<object[]>}
  */
@@ -81,11 +90,7 @@ async function findAllOrdered() {
 /**
  * Return filtered records for export, ordered by createdAt ASC.
  *
- * @param {{
- *   actor?: string,
- *   from?: Date|string,
- *   to?: Date|string
- * }} [filters]
+ * @param {{ actor?: string, from?: Date|string, to?: Date|string }} [filters]
  * @returns {Promise<object[]>}
  */
 async function findFiltered(filters = {}) {
@@ -117,27 +122,82 @@ async function count() {
   return prisma.logEntry.count();
 }
 
-// ─── Writes ───────────────────────────────────────────────────────────────────
+// ── Transactional write with row-level lock ───────────────────────────────────
 
 /**
- * Persist a new LogEntry inside a Prisma transaction.
- * Using a transaction prevents partial writes if the DB connection drops
- * mid-operation or a constraint violation rolls back the insert.
+ * Create a new LogEntry inside a serialised PostgreSQL transaction.
+ *
+ * The entire critical section executes atomically while ChainHead is locked:
+ *   BEGIN
+ *   → SELECT ... FOR UPDATE on chain_head (blocks concurrent writers)
+ *   → Read latestHash from the locked row
+ *   → Compute previousHash + currentHash via hash.service
+ *   → INSERT LogEntry
+ *   → UPDATE ChainHead
+ *   COMMIT
+ *
+ * Redis is never consulted here. PostgreSQL is the sole authority for the
+ * hash chain. Two concurrent requests cannot share the same previousHash
+ * because the second waits at the FOR UPDATE until the first commits.
+ *
+ * The raw SQL SELECT ... FOR UPDATE is the only permitted raw query in this
+ * codebase; Prisma does not expose row-level locking natively.
  *
  * @param {{
  *   actor: string,
  *   action: string,
  *   payload?: object|null,
- *   previousHash: string|null,
- *   currentHash: string,
- *   createdAt?: Date
- * }} data
+ *   createdAt: Date
+ * }} dto - Raw entry data. Hashes are computed inside the transaction.
  * @returns {Promise<object>} The persisted LogEntry.
  */
-async function create(data) {
-  return prisma.$transaction(async (tx) => {
-    return tx.logEntry.create({ data });
-  });
+async function createWithTransaction(dto) {
+  const { actor, action, payload = null, createdAt } = dto;
+
+  logger.debug('Transaction started');
+
+  try {
+    const entry = await prisma.$transaction(async (tx) => {
+      // ── Step 1: Acquire exclusive row lock ───────────────────────────────
+      const chainHeads = await tx.$queryRaw`
+        SELECT id, "latestHash" FROM chain_head WHERE id = 1 FOR UPDATE
+      `;
+      const chainHead = chainHeads[0];
+
+      // ── Step 2: Compute hashes from the locked ChainHead state ───────────
+      let previousHash;
+      let currentHash;
+
+      if (chainHead.latestHash === hashService.GENESIS_PREVIOUS_HASH) {
+        previousHash = hashService.GENESIS_PREVIOUS_HASH;
+        currentHash = hashService.createGenesisHash(actor, action, payload, createdAt);
+      } else {
+        previousHash = chainHead.latestHash;
+        currentHash = hashService.calculateCurrentHash(
+          actor, action, payload, previousHash, createdAt
+        );
+      }
+
+      // ── Step 3: Insert the new LogEntry ──────────────────────────────────
+      const created = await tx.logEntry.create({
+        data: { actor, action, payload, previousHash, currentHash, createdAt },
+      });
+
+      // ── Step 4: Update ChainHead ──────────────────────────────────────────
+      await tx.chainHead.update({
+        where: { id: 1 },
+        data: { latestHash: currentHash, latestLogId: created.id },
+      });
+
+      return created;
+    });
+
+    logger.debug({ entryId: entry.id }, 'Transaction committed');
+    return entry;
+  } catch (err) {
+    logger.error({ err }, 'Transaction rolled back');
+    throw err;
+  }
 }
 
 module.exports = {
@@ -148,5 +208,5 @@ module.exports = {
   findAllOrdered,
   findFiltered,
   count,
-  create,
+  createWithTransaction,
 };

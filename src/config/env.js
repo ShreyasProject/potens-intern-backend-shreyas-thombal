@@ -16,29 +16,23 @@ const dotenv = require('dotenv');
 const { z } = require('zod');
 
 // ── 1. Load .env into process.env ────────────────────────────────────────────
-// If the file is absent dotenv exits silently — we still validate whatever is
-// already in process.env (e.g. when running inside Docker or CI).
 dotenv.config();
 
 // ── 2. Zod schema ─────────────────────────────────────────────────────────────
 
 const envSchema = z.object({
-  /** TCP port the HTTP server will listen on. */
   PORT: z.coerce
     .number()
     .int('PORT must be an integer')
     .min(1, 'PORT must be at least 1')
     .max(65535, 'PORT must be at most 65535'),
 
-  /** Runtime environment — controls logging format and behaviour. */
   NODE_ENV: z.enum(['development', 'test', 'production'], {
     errorMap: () => ({ message: 'NODE_ENV must be one of: development, test, production' }),
   }),
 
-  /** PostgreSQL connection string used by Prisma. */
   DATABASE_URL: z.string().min(1, 'DATABASE_URL must be a non-empty string'),
 
-  /** Pino log level threshold. Defaults to "info". */
   LOG_LEVEL: z
     .enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal'], {
       errorMap: () => ({
@@ -47,25 +41,43 @@ const envSchema = z.object({
     })
     .default('info'),
 
-  /** Max requests per IP per window (optional, default 100). */
   RATE_LIMIT_MAX: z.coerce
     .number()
     .int('RATE_LIMIT_MAX must be an integer')
     .positive('RATE_LIMIT_MAX must be a positive integer')
     .default(100),
 
-  /** Rate-limit window in milliseconds (optional, default 60000). */
   RATE_LIMIT_WINDOW_MS: z.coerce
     .number()
     .int('RATE_LIMIT_WINDOW_MS must be an integer')
     .positive('RATE_LIMIT_WINDOW_MS must be a positive integer')
     .default(60000),
 
-  /** API key used to authenticate requests to protected endpoints. */
   API_KEY: z.string().min(1, 'API_KEY must be a non-empty string'),
 
-  /** Allowed CORS origin. Defaults to * (allow all). Restrict in production. */
   CORS_ORIGIN: z.string().default('*'),
+
+  /** Redis connection URL used by ioredis, BullMQ, and the cache service. */
+  REDIS_URL: z.string().url('REDIS_URL must be a valid URL').default('redis://localhost:6379'),
+
+  /** Number of concurrent BullMQ worker threads processing the verification queue. */
+  QUEUE_CONCURRENCY: z.coerce
+    .number()
+    .int('QUEUE_CONCURRENCY must be an integer')
+    .positive('QUEUE_CONCURRENCY must be a positive integer')
+    .default(2),
+
+  /**
+   * Redis cache TTL in seconds.
+   * Must be at least 1 — a value of 0 disables expiry entirely in Redis,
+   * which would turn the cache into persistent storage and violate the
+   * cache-aside pattern.
+   */
+  CACHE_TTL_SECONDS: z.coerce
+    .number()
+    .int('CACHE_TTL_SECONDS must be an integer')
+    .min(1, 'CACHE_TTL_SECONDS must be at least 1 second (0 would disable expiry)')
+    .default(600),
 });
 
 // ── 3. Parse & validate ───────────────────────────────────────────────────────
@@ -98,7 +110,10 @@ const raw = parsed.data;
  *   rateLimitMax: number,
  *   rateLimitWindowMs: number,
  *   apiKey: string,
- *   corsOrigin: string
+ *   corsOrigin: string,
+ *   redisUrl: string,
+ *   queueConcurrency: number,
+ *   cacheTtlSeconds: number
  * }>}
  */
 const config = Object.freeze({
@@ -110,6 +125,9 @@ const config = Object.freeze({
   rateLimitWindowMs: raw.RATE_LIMIT_WINDOW_MS,
   apiKey: raw.API_KEY,
   corsOrigin: raw.CORS_ORIGIN,
+  redisUrl: raw.REDIS_URL,
+  queueConcurrency: raw.QUEUE_CONCURRENCY,
+  cacheTtlSeconds: raw.CACHE_TTL_SECONDS,
 });
 
 module.exports = { config };
